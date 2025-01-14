@@ -1,0 +1,1050 @@
+// This program provides a comprehensive solution for managing an IoT device 
+// with WiFi, NTP, motion detection, PWM control, and Bluetooth functionalities.
+// It includes robust security measures and a user-friendly web interface for 
+// configuration and monitoring. 
+
+// The LED control logic is sophisticated, allowing for different behaviors 
+// during day and night modes, and ensuring energy efficiency by dimming 
+// or turning off the LED when no motion is detected.
+
+// The program also ensures accurate timekeeping by synchronizing the RTC 
+// with an NTP server and adjusting the time if necessary. 
+
+// The user can configure the start and end times for day and night modes, 
+// and these times are compared with the current time obtained from the 
+// NTP server or RTC.
+
+
+#include <WiFi.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <RTClib.h>
+#include <WebServer.h>
+#include <vector>
+#include <EEPROM.h>
+#include "BluetoothSerial.h"
+
+// Definicje adresów w EEPROM
+const int EEPROM_ADDR_MAX_PWM_DZIENNE = 0;
+const int EEPROM_ADDR_PWM_STANDBY = 4;
+const int EEPROM_ADDR_MAX_PWM_NOC = 8;
+const int EEPROM_ADDR_CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS = 12;
+const int EEPROM_ADDR_CZAS_SWIECENIA_W_STANDBY_MS = 16;
+const int EEPROM_ADDR_SSID = 20;
+const int EEPROM_ADDR_PASSWORD = 52;
+
+// Domyślne wartości
+const int DEFAULT_MAX_PWM_DZIENNE = 220;
+const int DEFAULT_PWM_STANDBY = 10;
+const int DEFAULT_MAX_PWM_NOC = 10;
+const unsigned long DEFAULT_CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS = 30000;  // 30 sekund
+const unsigned long DEFAULT_CZAS_SWIECENIA_W_STANDBY_MS = 30000;          // 30 sekund
+const char* DEFAULT_SSID = "ORBI18";
+const char* DEFAULT_PASSWORD = "izoalkohol123";
+
+// Zmienne globalne
+int MAX_PWM_DZIENNE;
+int PWM_STANDBY;
+int MAX_PWM_NOC;
+unsigned long CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS;
+unsigned long CZAS_SWIECENIA_W_STANDBY_MS;
+char ssid[32];
+char password[64];
+
+// Dane logowania do sieci WiFi
+struct LogEntry {
+  String ip;
+  String logTime;  // Zmieniona nazwa zmiennej
+};
+std::vector<LogEntry> logEntries;
+std::vector<String> fakeSetupEntries;
+
+// Zmienne globalne dla czasu - wyświetlane na HTML
+int currentHour = 0;
+int currentMinute = 0;
+int currentSecond = 0;
+int dozwolona_roznica_sekund_RCP_NTP = 10;
+
+// Define the PWM properties
+const int pwmChannel = 0;       // PWM channel
+const int pwmFrequency = 5000;  // Frequency in Hz
+const int pwmResolution = 8;    // 8-bit resolution (0-255)
+
+// przycisk na ww na hasło
+const String correctLogin = "123";
+const String correctPassword = "123";
+
+// Debug mode - set to true to enable serial logging
+const bool DEBUG_MODE = false;
+
+// Set this to the pin connected to the PIR motion sensor
+const byte PIN_CZUJNIKA_RUCHU = 16;  // D5 (GPIO14) for PIR sensor on D1 R32
+
+// Set this to the pin supplying power to the LED control board ICs (PWM for LED)
+const byte PIN_ZARZADZANIA_LED = 5;  // D4 (GPIO2) for LED control on D1 R32
+
+// Set this to change the power-off delay (in seconds)
+const unsigned long CZAS_OPUZNIENIA_WYLACZENIA_SEKUNDY = 60;  // Changed to 30 seconds
+
+// obsługa serial po bluetooth
+BluetoothSerial SerialBT;
+
+// dodajemy zmienną globalną na potrzeby wysyłąnia na serwer
+String ostatnioWyslaneDane = "";
+DateTime czasUruchomieniaSystemu;
+
+String CZAS_OSTATNIEJ_SYNCHRONIZACJI_G_M_S = "";
+String czasUruchomieniaString;
+
+// Ustawienia NTP
+WiFiUDP ntpUDP;                                             // Obiekt do komunikacji UDP z serwerem NTP
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 3600, 60000);  // Inicjalizacja klienta NTP z serwerem "pool.ntp.org", strefa czasowa UTC+1, odświeżanie co minutę
+
+// Obiekt dla zegara RTC
+RTC_DS3231 rtc;  // Tworzenie obiektu zegara RTC DS3231
+
+// Tworzenie serwera HTTP
+WebServer server(80);  // Tworzenie serwera HTTP nasłuchującego na porcie 80
+
+// Zmienna globalna na status wysyłki danych
+String statusWysylki = "Brak danych";
+
+// Declare global variables for control
+int PWM_AKTUALNE = 0;       // Global variable for PWM value
+
+unsigned long CZAS_OSTATNIEGO_WYSYLANIA_MS = 0;              // Ostatni czas wysyłania danych na serwer
+const unsigned long INTERWAL_WYSYLANIA_MS = 10 * 60 * 1000;  // Interwał 10 minut (w milisekundach)
+
+unsigned long CZAS_WLACZENIA_MS = 0;                     // Global variable for time when the LEDs were turned on (in milliseconds)
+unsigned long CZAS_BIEZACY_MS = 0;                       // Global variable for the current time (in milliseconds)
+unsigned long CZAS_OD_WYKRYCIA_RUCHU_MS = 0;             // Global variable for time since last motion detection (in milliseconds)
+unsigned long CZAS_OSTATNIEGO_SPRAWDZENIA_RUCHU_MS = 0;  // Additional variable to track last motion check time (in milliseconds)
+
+// synchronizacja NTP z L2CRTC
+const unsigned long INTERWAL_SINCHRONIZACJI_NTP_MS = 24 * 60 * 60 * 1000;  // 24 godziny w milisekundach
+unsigned long CZAS_OSTATNIEJ_SYNCHRONIZACJI_MS = 0;                        // Ostatni czas synchronizacji z NTP
+
+// Deklaracje funkcji
+void synchronizujCzasZNTP();
+void synchronizujNTP();
+void wyslijDaneSerwerWWW();
+void obslugaRuchu();
+void aktualizujPWM(unsigned long czasOdWykryciaRuchu);
+void logDebugInfo();
+void Shine_from_current_point_within_5SEC();
+void wyslijDaneNaSerwer();
+void handleRoot();
+void handleReset();
+void handleFakeSetup();
+void handleUpdate();
+void saveVariablesToEEPROM();
+void readEEPROM();
+
+void handleFakeSetup() {
+  String clientIP = server.client().remoteIP().toString();
+  fakeSetupEntries.push_back(clientIP);
+  server.send(200, "text/html", "<html><body><h0>That's the trap dude - we got ya... revenge expected </h0></body></html>");
+}
+
+// Funkcja synchronizująca czas z NTP
+void synchronizujNTP() {
+  unsigned long czasBiezacyMs = millis();
+
+  if (czasBiezacyMs - CZAS_OSTATNIEJ_SYNCHRONIZACJI_MS >= INTERWAL_SINCHRONIZACJI_NTP_MS) {
+    timeClient.update();
+    unsigned long epochTime = timeClient.getEpochTime();
+    DateTime ntpTime(epochTime);
+    rtc.adjust(ntpTime);
+    CZAS_OSTATNIEJ_SYNCHRONIZACJI_MS = czasBiezacyMs;
+
+    if (DEBUG_MODE) {
+      Serial.println("Synchronizacja z NTP zakończona.");
+    }
+  }
+}
+
+void synchronizujCzasZNTP() {
+  timeClient.begin();
+  unsigned long startTime = millis();
+  const unsigned long timeout = 500;  // Maksymalny czas oczekiwania na synchronizację (5 sekund)
+
+  // Czekanie na synchronizację NTP z limitem czasowym
+  while (!timeClient.update()) {
+    timeClient.forceUpdate();
+    if (millis() - startTime > timeout) {
+      if (DEBUG_MODE) {
+        Serial.println("Błąd: Nie udało się zsynchronizować czasu z NTP w ciągu 5 sekund.");
+      }
+      return;  // Wyjście z funkcji, jeśli synchronizacja nie powiedzie się
+    }
+  }
+
+  // Pobranie czasu z NTP (uwzględniając strefę czasową, jeśli skonfigurowano w timeClient)
+  unsigned long epochTime = timeClient.getEpochTime();
+  
+  // Konwersja czasu UNIX na komponenty daty i godziny
+  DateTime now(epochTime);  // Klasa DateTime z biblioteki RTClib obsługuje czas UNIX
+  
+  // Synchronizacja RTC
+  rtc.adjust(now);  // Ustawienie aktualnej daty i czasu w RTC
+  
+  // Debugowanie
+  if (DEBUG_MODE) {
+    Serial.print("Zsynchronizowano czas z NTP: ");
+    Serial.print(now.year());
+    Serial.print("-");
+    Serial.print(now.month());
+    Serial.print("-");
+    Serial.print(now.day());
+    Serial.print(" ");
+    Serial.print(now.hour());
+    Serial.print(":");
+    Serial.print(now.minute());
+    Serial.print(":");
+    Serial.println(now.second());
+  }
+
+  // Aktualizacja zmiennych globalnych (opcjonalne)
+  currentHour = now.hour();
+  currentMinute = now.minute();
+  currentSecond = now.second();
+  CZAS_OSTATNIEJ_SYNCHRONIZACJI_G_M_S = (currentHour * 3600) + (currentMinute * 60) + currentSecond;
+  CZAS_OSTATNIEJ_SYNCHRONIZACJI_MS = millis();
+}
+
+void synchronizujRTCzNTP() {
+  if (timeClient.update()) {  // Próba aktualizacji czasu z NTP
+    unsigned long epochTime = timeClient.getEpochTime();
+    DateTime ntpTime(epochTime);
+    DateTime rtcTime = rtc.now();
+
+    long roznicaSekund = ntpTime.unixtime() - rtcTime.unixtime();
+
+    // Jeśli różnica między RTC a NTP wynosi więcej niż 10 sec, skoryguj RTC
+    if (abs(roznicaSekund) > dozwolona_roznica_sekund_RCP_NTP ) {
+      rtc.adjust(ntpTime);
+      if (DEBUG_MODE) {
+        Serial.println("RTC zsynchronizowany z NTP.");
+        Serial.print("Różnica czasu: ");
+        Serial.println(roznicaSekund);
+      }
+    } else if (DEBUG_MODE) {
+      Serial.println("RTC nie wymaga synchronizacji.");
+    }
+  } else if (DEBUG_MODE) {
+    Serial.println("Błąd: Nie udało się zsynchronizować czasu z NTP.");
+  }
+}
+
+// Funkcja wysyłająca dane na serwer WWW
+void wyslijDaneSerwerWWW() {
+  unsigned long czasBiezacyMs = millis();
+
+  if (czasBiezacyMs - CZAS_OSTATNIEGO_WYSYLANIA_MS >= INTERWAL_WYSYLANIA_MS) {
+    wyslijDaneNaSerwer();
+    CZAS_OSTATNIEGO_WYSYLANIA_MS = czasBiezacyMs;
+
+    if (DEBUG_MODE) {
+      Serial.println("Dane wysłane na serwer.");
+    }
+  }
+
+  server.handleClient();
+}
+
+// Funkcja obsługująca detekcję ruchu
+void obslugaRuchu() {
+  // Aktualizacja globalnej zmiennej czasu
+  CZAS_BIEZACY_MS = millis();
+
+  // Obliczenie czasu od ostatniego wykrycia ruchu
+  CZAS_OD_WYKRYCIA_RUCHU_MS = CZAS_BIEZACY_MS - CZAS_WLACZENIA_MS;
+
+  // Sprawdzenie stanu czujnika ruchu
+  if (digitalRead(PIN_CZUJNIKA_RUCHU) == HIGH) {
+    // Aktualizacja czasu wykrycia ruchu
+    CZAS_WLACZENIA_MS = CZAS_BIEZACY_MS;
+    CZAS_OSTATNIEGO_SPRAWDZENIA_RUCHU_MS = CZAS_BIEZACY_MS;
+
+    if (DEBUG_MODE) {
+      Serial.println("Wykryto ruch.");
+      Serial.print("CZAS_WLACZENIA_MS: ");
+      Serial.println(CZAS_WLACZENIA_MS);
+    }
+
+    // Rozjaśnianie światła, jeśli wartość PWM jest poniżej progu
+    if (PWM_AKTUALNE <= 0 || PWM_AKTUALNE < MAX_PWM_DZIENNE) {
+      while (PWM_AKTUALNE < MAX_PWM_DZIENNE) {
+        PWM_AKTUALNE += 5;  // Zwiększaj PWM o ustalony krok
+        if (PWM_AKTUALNE > MAX_PWM_DZIENNE) {
+          PWM_AKTUALNE = MAX_PWM_DZIENNE;  // Ogranicz do wartości maksymalnej
+        }
+        ledcWrite(pwmChannel, PWM_AKTUALNE);  // Wyślij wartość PWM
+        delay(50);  // Dodaj opóźnienie dla płynnego rozjaśniania
+      }
+    } else {
+      // Ustaw maksymalną wartość PWM, jeśli nie wymaga rozjaśniania
+      PWM_AKTUALNE = MAX_PWM_DZIENNE;
+      ledcWrite(pwmChannel, PWM_AKTUALNE);
+    }
+  }
+
+  // Wywołanie funkcji aktualizującej PWM w zależności od czasu od ostatniego ruchu
+  aktualizujPWM(CZAS_OD_WYKRYCIA_RUCHU_MS);
+}
+
+// ------------------ łączenie z WIFI
+void polaczZWIFI() {
+  Serial.println("\nŁączenie z siecią WiFi...");
+  WiFi.begin(ssid, password);
+
+  unsigned long startAttemptTime = millis();
+  const unsigned long wifiTimeout = 3000; // 3 sekundy
+
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < wifiTimeout) {
+    delay(100); // krótszy czas oczekiwania w pętli
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nPołączono z WiFi");
+    Serial.print("Adres IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nNie udało się połączyć z WiFi, spróbujemy później");
+  }
+}
+
+// Funkcja aktualizująca jasność LED w zależności od czasu
+void aktualizujPWM(unsigned long czasOdWykryciaRuchu) {
+  if (czasOdWykryciaRuchu >= CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS &&
+      czasOdWykryciaRuchu < CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS + CZAS_SWIECENIA_W_STANDBY_MS) {
+
+    if (DEBUG_MODE) {
+      Serial.print("| STANDBY ON |");
+    }
+
+    if (PWM_AKTUALNE != PWM_STANDBY) {
+      PWM_AKTUALNE = max(PWM_AKTUALNE - 3, PWM_STANDBY);
+      ledcWrite(pwmChannel, PWM_AKTUALNE);
+      delay(50);
+
+      if (DEBUG_MODE) {
+        Serial.print("PWM_AKTUALNE after standby: ");
+        Serial.print(PWM_AKTUALNE);
+      }
+    }
+  } else if (czasOdWykryciaRuchu >= CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS + CZAS_SWIECENIA_W_STANDBY_MS) {
+    if (DEBUG_MODE) {
+      Serial.print("| POWER OFF |");
+    }
+
+    if (PWM_AKTUALNE != 0) {
+      PWM_AKTUALNE = max(PWM_AKTUALNE - 3, 0);
+      ledcWrite(pwmChannel, PWM_AKTUALNE);
+      delay(50);
+
+      if (DEBUG_MODE) {
+        Serial.print("PWM_AKTUALNE after power off: ");
+        Serial.print(PWM_AKTUALNE);
+      }
+    }
+  }
+}
+
+// Funkcja logująca dane debugowe
+void logDebugInfo() {
+  if (DEBUG_MODE) {
+    Serial.print("CZAS_BIEZACY_MS: ");
+    Serial.print(millis());
+    Serial.print(", PWM_AKTUALNE: ");
+    Serial.print(PWM_AKTUALNE);
+  }
+}
+
+// Set up the pins connected to the motion sensor and supplying power to the LED controller.
+void setup() {
+  pinMode(PIN_CZUJNIKA_RUCHU, INPUT_PULLUP);  // ESP8266 requires explicit pullup
+  digitalWrite(PIN_CZUJNIKA_RUCHU, HIGH);     // Enable pull-up resistor (optional)
+
+  pinMode(PIN_ZARZADZANIA_LED, OUTPUT);
+
+  // Configure LED PWM
+  ledcSetup(pwmChannel, pwmFrequency, pwmResolution);
+  ledcAttachPin(PIN_ZARZADZANIA_LED, pwmChannel);
+  ledcWrite(pwmChannel, 0);  // Start with LED off (PWM 0)
+
+  if (DEBUG_MODE) {
+    Serial.begin(115200);  // Initialize the serial port at 115200 baud rate for ESP8266
+  }
+
+  Serial.begin(115200);
+
+  // Inicjalizacja EEPROM
+  EEPROM.begin(512);
+
+  // Sprawdzenie, czy EEPROM jest pusty lub zawiera nieprawidłowe dane  ----------------------BAZOWE WARTOŚCI EEPROM !!!!!!!!!!!!!!!!
+  if (EEPROM.read(EEPROM_ADDR_MAX_PWM_DZIENNE) == 255 || EEPROM.read(EEPROM_ADDR_MAX_PWM_DZIENNE) == 0) {
+    // Ustawienie wartości domyślnych
+    MAX_PWM_DZIENNE = 220;
+    PWM_STANDBY = 10;
+    MAX_PWM_NOC = 10;
+    CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS = 30000;
+    CZAS_SWIECENIA_W_STANDBY_MS = 30000;
+    strncpy(ssid, "ORBI18", sizeof(ssid));
+    strncpy(password, "izoalkohol123", sizeof(password));
+
+    Serial.println("pusty_EEPROM");
+
+    // Zapisanie wartości domyślnych do EEPROM
+    saveVariablesToEEPROM();
+  } else {
+    // Odczyt wartości z EEPROM
+    EEPROM.get(EEPROM_ADDR_MAX_PWM_DZIENNE, MAX_PWM_DZIENNE);
+    EEPROM.get(EEPROM_ADDR_PWM_STANDBY, PWM_STANDBY);
+    EEPROM.get(EEPROM_ADDR_MAX_PWM_NOC, MAX_PWM_NOC);
+    EEPROM.get(EEPROM_ADDR_CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS, CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS);
+    EEPROM.get(EEPROM_ADDR_CZAS_SWIECENIA_W_STANDBY_MS, CZAS_SWIECENIA_W_STANDBY_MS);
+    EEPROM.get(EEPROM_ADDR_SSID, ssid);
+    EEPROM.get(EEPROM_ADDR_PASSWORD, password);
+  }
+
+  // Łączenie z WiFi
+ Serial.println("\nŁączenie z siecią WiFi...");
+ WiFi.begin(ssid, password);
+
+ unsigned long startAttemptTime = millis();
+ const unsigned long wifiTimeout = 100; // 0,1 sekundy
+
+ while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < wifiTimeout) {
+    delay(100);
+    Serial.print(".");
+  }
+
+ if (WiFi.status() == WL_CONNECTED) {
+   Serial.println("\nPołączono z WiFi");
+   Serial.print("Adres IP: ");
+   Serial.println(WiFi.localIP());
+ } else {
+   Serial.println("\nNie udało się połączyć z WiFi");
+   // Możesz dodać tutaj kod obsługi błędu, np. restart urządzenia lub przejście do trybu offline
+   // ESP.restart(); // Restart urządzenia
+ }
+
+  // Inicjalizacja klienta NTP
+  timeClient.begin();
+
+  // Inicjalizacja zegara RTC
+ if (!rtc.begin()) {
+        Serial.println("Nie można znaleźć modułu RTC.");
+        while (1);  // Zatrzymaj, jeśli RTC jest niedostępne
+    }
+
+    if (rtc.lostPower()) {
+        Serial.println("RTC stracił zasilanie, ustawiam czas na domyślny.");
+        rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));  // Ustaw czas kompilacji
+    }
+
+    // Inicjalizacja NTP
+    timeClient.begin();
+
+  // Ustawienie stron serwera
+  server.on("/", handleRoot);      // Strona główna
+  server.on("/send", handleSend);  // Wywołanie wysyłania danych
+  server.on("/reset", handleReset);
+  server.on("/update", handleUpdate);  // Wywołanie aktualizacji danych
+
+  // Start serwera
+  server.begin();
+  Serial.println("Serwer HTTP uruchomiony");
+
+  // Inicjalizacja serwera WWW pod fake setup
+  server.on("/", handleRoot);
+  server.on("/fake_setup", HTTP_POST, handleFakeSetup);
+  server.begin();
+
+
+
+ ustawCzasUruchomienia(); // pobiera czas z RTC przy uruchomieniu i wywala ją do globalnej zmiennej ustawCzasUruchomienia
+
+  Serial.println(czasUruchomieniaString);
+
+  // odpalenei bluettoth 
+  SerialBT.begin("ESP32_EEPROM_Config"); // Nazwa Bluetooth widoczna w urządzeniach
+  Serial.println("Bluetooth started. Waiting for commands...");
+  
+}
+
+
+// obsługa odbierania danych przez bluetooth i zapis ich do EEPROM
+
+void handleBluetoothCommands() {
+  if (SerialBT.available()) {
+    String input = SerialBT.readStringUntil('\n'); // Odczyt danych do znaku nowej linii
+    Serial.print("Received command: ");
+    Serial.println(input);
+
+    // Rozdziel komendę i wartości
+    if (input.startsWith("SET_SSID=")) {
+      String newSSID = input.substring(9); // Wyciągnij wartość po "SET_SSID="
+      if (newSSID.length() > 32) {
+        SerialBT.println("SSID too long! Max 32 characters.");
+        return;
+      }
+      newSSID.toCharArray(ssid, sizeof(ssid)); // Przypisz do zmiennej ssid
+      EEPROM.put(EEPROM_ADDR_SSID, ssid);
+      EEPROM.commit();
+      SerialBT.println("SSID updated successfully.");
+    } else if (input.startsWith("SET_PASSWORD=")) {
+      String newPassword = input.substring(13); // Wyciągnij wartość po "SET_PASSWORD="
+      if (newPassword.length() > 20) {
+        SerialBT.println("Password too long! Max 20 characters.");
+        return;
+      }
+      newPassword.toCharArray(password, sizeof(password)); // Przypisz do zmiennej password
+      EEPROM.put(EEPROM_ADDR_PASSWORD, password);
+      EEPROM.commit();
+      SerialBT.println("Password updated successfully.");
+    } else if (input.startsWith("GET_VALUES")) {
+      // Wysyłanie aktualnych wartości zapisanych w EEPROM
+      SerialBT.println("Current EEPROM values:");
+      SerialBT.printf("MAX_PWM_DZIENNE: %d\n", MAX_PWM_DZIENNE);
+      SerialBT.printf("PWM_STANDBY: %d\n", PWM_STANDBY);
+      SerialBT.printf("MAX_PWM_NOC: %d\n", MAX_PWM_NOC);
+      SerialBT.printf("CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS: %d\n", CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS);
+      SerialBT.printf("CZAS_SWIECENIA_W_STANDBY_MS: %d\n", CZAS_SWIECENIA_W_STANDBY_MS);
+      SerialBT.printf("SSID: %s\n", ssid);
+      SerialBT.printf("Password: %s\n", password);
+    } else {
+      SerialBT.println("Unknown command. Use SET_SSID, SET_PASSWORD, or GET_VALUES.");
+    }
+  }
+}
+
+
+
+
+// Funkcja do ustawienia czasu w zmiennej czasUruchomieniaString =- ----- zwraca czas uruchomienia systemu w Main Setup STRING do wyświetlenia - jest RAZ bo RAZ się system włącza 
+void ustawCzasUruchomienia() {
+  DateTime now = rtc.now();  // Pobranie bieżącego czasu z zegara RTC
+
+ // Formatowanie daty w formacie "YYYY-MM-DD"
+String yearStr = String(now.year());
+String monthStr = (now.month() < 10) ? "0" + String(now.month()) : String(now.month());
+String dayStr = (now.day() < 10) ? "0" + String(now.day()) : String(now.day());
+
+// Formatowanie czasu w formacie "hh:mm:ss"
+String hourStr = (now.hour() < 10) ? "0" + String(now.hour()) : String(now.hour());
+String minuteStr = (now.minute() < 10) ? "0" + String(now.minute()) : String(now.minute());
+String secondStr = (now.second() < 10) ? "0" + String(now.second()) : String(now.second());
+
+// Składanie ciągu daty i czasu
+czasUruchomieniaString = yearStr + "-" + monthStr + "-" + dayStr + " " + 
+                         hourStr + ":" + minuteStr + ":" + secondStr;
+}
+
+
+// Function to brighten from current PWM to MAX_PWM_DZIENNE within 5 seconds
+// Function to brighten from current PWM to MAX_PWM_DZIENNE within 5 seconds
+void Shine_from_current_point_within_5SEC() {
+    int durationMS = 5000;  // Czas rozjaśniania w milisekundach
+    unsigned long startTime = millis();
+    int stepCount = MAX_PWM_DZIENNE - PWM_AKTUALNE;
+
+    if (stepCount <= 0) {
+        return;  // Jeśli PWM jest już maksymalne, zakończ funkcję
+    }
+
+    int stepDelay = durationMS / stepCount;
+    if (stepDelay < 5) {
+        stepDelay = 5;  // Minimalny czas na krok
+    }
+
+    for (int pwmValue = PWM_AKTUALNE; pwmValue <= MAX_PWM_DZIENNE; pwmValue++) {
+        if (millis() - startTime >= durationMS) {
+            break;  // Wyjście z pętli po upływie czasu
+        }
+
+        PWM_AKTUALNE = pwmValue;  // Zaktualizuj aktualną wartość PWM
+        ledcWrite(pwmChannel, PWM_AKTUALNE);  // Wyślij wartość do kanału PWM
+        delay(stepDelay);  // Poczekaj na kolejny krok
+    }
+
+    // Upewnij się, że wartość PWM jest równa MAX_PWM_DZIENNE na koniec
+    PWM_AKTUALNE = MAX_PWM_DZIENNE;
+    ledcWrite(pwmChannel, PWM_AKTUALNE);
+
+    // Po rozjaśnieniu spróbuj połączyć się z WiFi, jeśli jest rozłączone
+    if (WiFi.status() != WL_CONNECTED) {
+        polaczZWIFI();  // Wywołanie funkcji połączenia z WiFi
+    }
+}
+
+
+
+void wyslijDaneNaSerwer() {
+  WiFiClient client;
+  const char* host = "example.com";  // Zmień na adres swojego serwera
+  const int port = 80;
+
+  if (!client.connect(host, port)) {
+    statusWysylki = "Nie można połączyć się z serwerem!";
+    return;
+  }
+
+  String url = "/path/to/endpoint";             // Zmień na ścieżkę na serwerze
+  String data = "param1=value1&param2=value2";  // Dane do wysłania (zmień według potrzeb)
+
+  // Tworzenie żądania HTTP POST
+  client.println("POST " + url + " HTTP/1.1");
+  client.println("Host: " + String(host));
+  client.println("Content-Type: application/x-www-form-urlencoded");
+  client.println("Connection: close");
+  client.print("Content-Length: ");
+  client.println(data.length());
+  client.println();
+  client.println(data);
+
+  // Odczyt odpowiedzi serwera
+  while (client.connected() || client.available()) {
+    if (client.available()) {
+      String response = client.readString();
+      statusWysylki = "Odpowiedź serwera: " + response;
+    }
+  }
+
+  client.stop();
+  if (statusWysylki == "") {
+    statusWysylki = "Dane wysłane, brak odpowiedzi serwera.";
+  }
+}
+
+
+// Konwersja INTERWAL_SINCHRONIZACJI_NTP_MS do godzin
+unsigned long intervalSinchroNtpMs = INTERWAL_SINCHRONIZACJI_NTP_MS;
+unsigned long intervalSinchroNtpHours = intervalSinchroNtpMs / 1000 / 3600;  // Godziny
+
+// Konwersja CZAS_OSTATNIEJ_SYNCHRONIZACJI_MS na godzinę, minutę i sekundę
+unsigned long czasOstatniejSynchroMs = CZAS_OSTATNIEJ_SYNCHRONIZACJI_MS;
+unsigned long hours = czasOstatniejSynchroMs / 1000 / 3600;
+unsigned long minutes = (czasOstatniejSynchroMs / 1000 % 3600) / 60;
+unsigned long seconds = (czasOstatniejSynchroMs / 1000 % 3600) % 60;
+
+
+
+
+
+
+
+
+
+
+
+
+void handleRoot() {
+DateTime rtcTime = rtc.now();
+timeClient.update();
+unsigned long epochTime = timeClient.getEpochTime();
+DateTime ntpTime(epochTime);
+
+String rtcTimestamp = rtcTime.timestamp();
+String rtcDate = rtcTimestamp.substring(0, rtcTimestamp.indexOf('T'));
+String rtcTimeOnly = rtcTimestamp.substring(rtcTimestamp.indexOf('T') + 1);
+
+String ntpTimestamp = ntpTime.timestamp();
+String ntpDate = ntpTimestamp.substring(0, ntpTimestamp.indexOf('T'));
+String ntpTimeOnly = ntpTimestamp.substring(ntpTimestamp.indexOf('T') + 1);
+
+String clientIP = server.client().remoteIP().toString();
+String logTime = rtcTimeOnly;
+
+logEntries.push_back({clientIP, logTime});
+
+// Obliczanie różnicy czasu w sekundach
+long roznicaCzasuRTC_NTP = rtcTime.unixtime() - ntpTime.unixtime();
+
+String html = "<html><head>";
+html += "<meta charset=\"UTF-8\">";
+html += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
+html += "<style>";
+html += "body { font-family: 'Roboto', sans-serif; background-color: #f4f4f4; color: #333; margin: 0; padding: 0; }";
+html += "header { background-color: #1a73e8; color: white; padding: 10px 0; text-align: center; }";
+html += "h1, h2 { color: #1a73e8; }";
+html += "h1 { font-size: 28px; margin: 20px 0; }";
+html += "h2 { font-size: 24px; margin: 20px 0; }";
+html += "pre { background-color: #fff; padding: 10px; border: 1px solid #ddd; border-radius: 4px; overflow-x: auto; }";
+html += "a { color: #1a73e8; text-decoration: none; }";
+html += "a:hover { text-decoration: underline; }";
+html += "form { margin: 20px 0; }";
+html += "input[type='text'], input[type='password'], input[type='submit'] { padding: 10px; margin: 5px 0; border: 1px solid #ddd; border-radius: 4px; width: 100%; max-width: 300px; }";
+html += "input[type='submit'] { background-color: #1a73e8; color: white; border: none; cursor: pointer; }";
+html += "input[type='submit']:hover { background-color: #155ab6; }";
+html += ".container { padding: 20px; max-width: 800px; margin: auto; }";
+html += "</style>";
+html += "<link href='https://fonts.googleapis.com/css?family=Roboto:400,700' rel='stylesheet'>";
+html += "</head><body>";
+html += "<header><h1>IoT Management</h1></header>";
+html += "<div class='container'>";
+
+// Dodanie formularza do FAKE SETUP
+html += "<h2>SYSTEM SETUP:</h2>";
+html += "<form action=\"/fake_setup\" method=\"POST\">";
+html += "<input type=\"submit\" value=\"SETUP\">";
+html += "</form>";
+
+// Dodanie różnicy czasu między RTC a NTP
+html += "<h2>Różnica czasu między RTC a NTP (w sekundach):</h2>";
+html += "<pre>" + String(roznicaCzasuRTC_NTP) + "</pre>";
+
+html += "<h2>Czas z RTC:</h2>";
+html += "<p>" + rtcDate + "<br>" + rtcTimeOnly + "</p>";
+
+html += "<h2>Czas z NTP:</h2>";
+html += "<p>" + ntpDate + "<br>" + ntpTimeOnly + "</p>";
+
+html += "<h2>Informacje o zmiennych i statusie funkcji:</h2>";
+html += "<pre>";
+html += "epochTime: " + String(epochTime) + "\n";
+html += "rtcTimestamp: " + rtcTimestamp + "\n";
+html += "rtcDate: " + rtcDate + "\n";
+html += "rtcTimeOnly: " + rtcTimeOnly + "\n";
+html += "ntpTimestamp: " + ntpTimestamp + "\n";
+html += "ntpDate: " + ntpDate + "\n";
+html += "ntpTimeOnly: " + ntpTimeOnly + "\n";
+html += "timeClient.getFormattedTime(): " + timeClient.getFormattedTime() + "\n";
+html += "timeClient.getHours(): " + String(timeClient.getHours()) + "\n";
+html += "timeClient.getMinutes(): " + String(timeClient.getMinutes()) + "\n";
+html += "timeClient.getSeconds(): " + String(timeClient.getSeconds()) + "\n";
+html += "</pre>";
+
+// Dodanie formularza do wpisania loginu i hasła
+html += "<h2>Resetowanie urządzenia:</h2>";
+html += "<form action=\"/reset\" method=\"POST\">";
+html += "Login: <input type=\"text\" name=\"login\"><br>";
+html += "Hasło: <input type=\"password\" name=\"password\"><br>";
+html += "<input type=\"submit\" value=\"Resetuj urządzenie\">";
+html += "</form>";
+
+html += "<h2>Informacje o dodatkowych zmiennych:</h2>";
+html += "<pre>";
+html += "MAX_PWM_DZIENNE: " + String(MAX_PWM_DZIENNE) + "\n";
+html += "currentHour: " + String(currentHour) + "\n";
+html += "currentMinute: " + String(currentMinute) + "\n";
+html += "currentSecond: " + String(currentSecond) + "\n";
+html += "Interwal co ile synchronizuje się NTP z RCP " + String(intervalSinchroNtpHours) + "\n";
+html += "hours: " + String(hours) + "\n";
+html += "minutes: " + String(minutes) + "\n";
+html += "seconds: " + String(seconds) + "\n";
+html += "statusWysylki: " + statusWysylki + "\n";
+html += "DEBUG_MODE: " + String(DEBUG_MODE) + "\n";
+html += "timeClient.update(): " + String(timeClient.update()) + "\n";
+html += "</pre>";
+
+// Dodanie czasu uruchomienia systemu
+// String czasUruchomieniaString = String(czasUruchomieniaSystemu.hour()) + ":" + String(czasUruchomieniaSystemu.minute()) + ":" + String(czasUruchomieniaSystemu.second());
+html += "<h2>Czas Uruchomienia Systemu - do niego ustawil sie RTC wg pobrania z NTP:</h2>";
+html += "<pre>" + czasUruchomieniaString + "</pre>";
+
+html += "<h2>INTERWAŁ PRZYMUSOWEJ SYNCHRONIZACJI :</h2>";
+html += String(intervalSinchroNtpHours) + " godziny<br>";
+
+//dozwolona_roznica_sekund_RCP_NTP
+html += "<h2>DOZWOLONA ROZBIEŻNOŚĆ RCP NTP (sec) :</h2>";
+html += String(dozwolona_roznica_sekund_RCP_NTP) + " sekund<br>";
+
+
+html += "<h2>CZAS_OSTATNIEJ_SYNCHRONIZACJI_MS (godzina):</h2>";
+html += String(hours) + ":" + String(minutes) + ":" + String(seconds) + "<br>";
+html += "<p><a href=\"/send\">Wyślij dane na serwer</a></p>";
+
+ // Dodanie informacji o stanie ESP32
+ html += "<h2>Informacje o stanie ESP32:</h2>";
+html += "<pre>";
+html += "WiFi SSID: " + String(WiFi.SSID()) + "\n";
+html += "WiFi RSSI: " + String(WiFi.RSSI()) + " dBm\n";
+html += "WiFi IP: " + WiFi.localIP().toString() + "\n";
+html += "WiFi MAC: " + WiFi.macAddress() + "\n";
+html += "CPU Frequency: " + String(ESP.getCpuFreqMHz()) + " MHz\n";
+html += "Free Heap: " + String(ESP.getFreeHeap()) + " bytes\n";
+html += "Chip Revision: " + String(ESP.getChipRevision()) + "\n";
+html += "Flash Chip Size: " + String(ESP.getFlashChipSize()) + " bytes\n";
+html += "Sketch Size: " + String(ESP.getSketchSize()) + " bytes\n";
+html += "Free Sketch Space: " + String(ESP.getFreeSketchSpace()) + " bytes\n";
+html += "</pre>";
+
+ // Dodanie informacji o stanie Bluetooth
+  html += "<h2>Informacje o stanie Bluetooth:</h2>";
+  html += "<pre>";
+  html += String("Bluetooth Name: ESP32_BT\n");  // Nazwa ustalona w SerialBT.begin()
+  html += String("Bluetooth Status: ") + (SerialBT.hasClient() ? "Connected" : "Not Connected") + "\n";
+  html += "</pre>";
+
+ 
+
+
+
+html += "<h2>Adresy IP, z których ktoś się logował:</h2>";
+html += "<ul>";
+for (const auto& entry : logEntries) {
+  html += "<li>" + entry.ip + " - " + entry.logTime + "</li>";
+}
+html += "</ul>";
+
+// Dodanie listy adresów IP, które kliknęły FAKE SETUP
+html += "<h2>Human Trapper:</h2>";
+html += "<ul>";
+for (const auto& ip : fakeSetupEntries) {
+  html += "<li>" + ip + "</li>";
+}
+html += "</ul>";
+
+html += "<h2>Aktualizacja wartości:</h2>";
+html += "<form action=\"/update\" method=\"POST\">";
+html += "MAX_PWM_DZIENNE: <input type=\"text\" name=\"max_pwm_dzienne\" value=\"" + String(MAX_PWM_DZIENNE) + "\"><br>";
+html += "PWM_STANDBY: <input type=\"text\" name=\"pwm_standby\" value=\"" + String(PWM_STANDBY) + "\"><br>";
+html += "MAX_PWM_NOC: <input type=\"text\" name=\"max_pwm_noc\" value=\"" + String(MAX_PWM_NOC) + "\"><br>";
+html += "CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS: <input type=\"text\" name=\"czas_swiecenia_po_wykryciu_ruchu_ms\" value=\"" + String(CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS) + "\"><br>";
+html += "CZAS_SWIECENIA_W_STANDBY_MS: <input type=\"text\" name=\"czas_swiecenia_w_standby_ms\" value=\"" + String(CZAS_SWIECENIA_W_STANDBY_MS) + "\"><br>";
+html += "SSID: <input type=\"text\" name=\"ssid\" value=\"" + String(ssid) + "\"><br>";
+html += "Password: <input type=\"text\" name=\"password\" value=\"" + String(password) + "\"><br>";
+html += "<input type=\"submit\" value=\"Aktualizuj\">";
+html += "</form>";
+
+html += "</div></body></html>";
+
+server.send(200, "text/html", html);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+void handleReset() {
+if (server.method() == HTTP_POST) {
+String login = server.arg("login");
+String password = server.arg("password");
+
+if (login == correctLogin && password == correctPassword) {
+ESP.restart();
+} else {
+server.send(200, "text/html", "<html lang=\"pl\"><head><meta charset=\"UTF-8\"><title>PRO IOT Device</title><style>"
+                              "body { font-family: Arial, sans-serif; background-color: #f4f4f9; text-align: center; padding: 50px; }"
+                              "h1 { color: #f44336; font-size: 2.5em; }"
+                              "a { display: inline-block; margin-top: 20px; padding: 10px 20px; background-color: #4CAF50; color: white; text-decoration: none; border-radius: 5px; }"
+                              "a:hover { background-color: #45a049; }</style></head>"
+                              "<body><h1>Błędny login lub hasło!</h1><a href=\"/\">Powrót</a></body></html>");
+
+}
+} else {
+server.send(405, "text/html", "<html lang=\"pl\"><head><meta charset=\"UTF-8\"><title>PRO IOT Device</title><style>"
+                              "body { font-family: Arial, sans-serif; background-color: #f4f4f9; text-align: center; padding: 50px; }"
+                              "h1 { color: #f44336; font-size: 2.5em; }"
+                              "</style></head><body><h1>Metoda niedozwolona</h1></body></html>");
+
+}
+}
+
+
+
+// Obsługa wysyłania danych
+void handleSend() {
+  wyslijDaneNaSerwer();
+  server.sendHeader("Location", "/");
+  server.send(303);  // Przekierowanie z powrotem na stronę główną
+}
+
+void pobierzGodzineZRtc() {
+    DateTime now = rtc.now();  // Pobierz aktualny czas z zegara RTC
+    currentHour = now.hour();
+    currentMinute = now.minute();
+    currentSecond = now.second();
+
+    // Logowanie w trybie debug (jeśli włączony)
+    if (DEBUG_MODE) {
+        Serial.print("Godzina: ");
+        Serial.print(currentHour);
+        Serial.print(":");
+        Serial.print(currentMinute);
+        Serial.print(":");
+        Serial.println(currentSecond);
+    }
+}
+
+void ustawMaxPWM() {
+pobierzGodzineZRtc();  // Pobierz godzinę z zegara RTC
+
+if (currentHour >= 6 && currentHour < 24) {
+MAX_PWM_DZIENNE = 220;  // Ustaw MAX PWM na 220 w godzinach 6-24
+} else {
+MAX_PWM_DZIENNE = MAX_PWM_NOC;  // W pozostałych godzinach użyj MAX_PWM_NOC
+}
+
+// Logowanie w trybie debug (jeśli włączony)
+if (DEBUG_MODE) {
+Serial.print("MAX_PWM_DZIENNE ustawione na: ");
+Serial.println(MAX_PWM_DZIENNE);
+}
+}
+
+void handleUpdate() {
+  if (server.method() == HTTP_POST) {
+    MAX_PWM_DZIENNE = server.arg("max_pwm_dzienne").toInt();
+    PWM_STANDBY = server.arg("pwm_standby").toInt();
+    MAX_PWM_NOC = server.arg("max_pwm_noc").toInt();
+    CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS = server.arg("czas_swiecenia_po_wykryciu_ruchu_ms").toInt();
+    CZAS_SWIECENIA_W_STANDBY_MS = server.arg("czas_swiecenia_w_standby_ms").toInt();
+    strcpy(ssid, server.arg("ssid").c_str());
+    strcpy(password, server.arg("password").c_str());
+
+    saveVariablesToEEPROM();  // Ensure this function is called to save updated values
+
+    server.send(200, "text/html", "<html lang=\"pl\"><head><meta charset=\"UTF-8\"><title>PRO IOT Device</title><style>"
+                              "body { font-family: Arial, sans-serif; background-color: #f4f4f9; text-align: center; padding: 50px; }"
+                              "h1 { color: #4CAF50; font-size: 2.5em; }"
+                              "a { display: inline-block; margin-top: 20px; padding: 10px 20px; background-color: #4CAF50; color: white; text-decoration: none; border-radius: 5px; }"
+                              "a:hover { background-color: #45a049; }</style></head>"
+                              "<body><h1>Wartości zaktualizowane!</h1><a href=\"/\">Powrót</a></body></html>");
+  } else {
+    server.send(405, "text/html", "<html lang=\"pl\"><head><meta charset=\"UTF-8\"><title>PRO IOT Device</title><style>"
+                              "body { font-family: Arial, sans-serif; background-color: #f4f4f9; text-align: center; padding: 50px; }"
+                              "h1 { color: #f44336; font-size: 2.5em; }"
+                              "</style></head><body><h1>Metoda niedozwolona</h1></body></html>");
+
+  }
+}
+
+void saveVariablesToEEPROM() {
+  EEPROM.put(EEPROM_ADDR_MAX_PWM_DZIENNE, MAX_PWM_DZIENNE);
+  EEPROM.put(EEPROM_ADDR_PWM_STANDBY, PWM_STANDBY);
+  EEPROM.put(EEPROM_ADDR_MAX_PWM_NOC, MAX_PWM_NOC);
+  EEPROM.put(EEPROM_ADDR_CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS, CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS);
+  EEPROM.put(EEPROM_ADDR_CZAS_SWIECENIA_W_STANDBY_MS, CZAS_SWIECENIA_W_STANDBY_MS);
+  EEPROM.put(EEPROM_ADDR_SSID, ssid);
+  EEPROM.put(EEPROM_ADDR_PASSWORD, password);
+  EEPROM.commit();
+
+  // Debugging output to verify values are written
+  Serial.println("Values saved to EEPROM:");
+  Serial.print("MAX_PWM_DZIENNE: ");
+  Serial.println(MAX_PWM_DZIENNE);
+  Serial.print("PWM_STANDBY: ");
+  Serial.println(PWM_STANDBY);
+  Serial.print("MAX_PWM_NOC: ");
+  Serial.println(MAX_PWM_NOC);
+  Serial.print("CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS: ");
+  Serial.println(CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS);
+  Serial.print("CZAS_SWIECENIA_W_STANDBY_MS: ");
+  Serial.println(CZAS_SWIECENIA_W_STANDBY_MS);
+  Serial.print("SSID: ");
+  Serial.println(ssid);
+  Serial.print("Password: ");
+  Serial.println(password);
+}
+
+void readEEPROM() {
+  EEPROM.begin(512);
+  EEPROM.get(EEPROM_ADDR_MAX_PWM_DZIENNE, MAX_PWM_DZIENNE);
+  EEPROM.get(EEPROM_ADDR_PWM_STANDBY, PWM_STANDBY);
+  EEPROM.get(EEPROM_ADDR_MAX_PWM_NOC, MAX_PWM_NOC);
+  EEPROM.get(EEPROM_ADDR_CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS, CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS);
+  EEPROM.get(EEPROM_ADDR_CZAS_SWIECENIA_W_STANDBY_MS, CZAS_SWIECENIA_W_STANDBY_MS);
+  EEPROM.get(EEPROM_ADDR_SSID, ssid);
+  EEPROM.get(EEPROM_ADDR_PASSWORD, password);
+
+  // Debugging output to verify values are read correctly
+  Serial.println("Values read from EEPROM:");
+  Serial.print("MAX_PWM_DZIENNE: ");
+  Serial.println(MAX_PWM_DZIENNE);
+  Serial.print("PWM_STANDBY: ");
+  Serial.println(PWM_STANDBY);
+  Serial.print("MAX_PWM_NOC: ");
+  Serial.println(MAX_PWM_NOC);
+  Serial.print("CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS: ");
+  Serial.println(CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS);
+  Serial.print("CZAS_SWIECENIA_W_STANDBY_MS: ");
+  Serial.println(CZAS_SWIECENIA_W_STANDBY_MS);
+  Serial.print("SSID: ");
+  Serial.println(ssid);
+  Serial.print("Password: ");
+  Serial.println(password);
+
+  // Check for invalid values and set defaults if necessary
+  if (MAX_PWM_DZIENNE <= 0 || PWM_STANDBY <= 0 || MAX_PWM_NOC <= 0 || CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS <= 0 || CZAS_SWIECENIA_W_STANDBY_MS <= 0 || strlen(ssid) == 0 || strlen(password) == 0) {
+    Serial.println("EEPROM contains invalid values, setting defaults...");
+    MAX_PWM_DZIENNE = DEFAULT_MAX_PWM_DZIENNE;
+    PWM_STANDBY = DEFAULT_PWM_STANDBY;
+    MAX_PWM_NOC = DEFAULT_MAX_PWM_NOC;
+    CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS = DEFAULT_CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS;
+    CZAS_SWIECENIA_W_STANDBY_MS = DEFAULT_CZAS_SWIECENIA_W_STANDBY_MS;
+    strcpy(ssid, DEFAULT_SSID);
+    strcpy(password, DEFAULT_PASSWORD);
+    saveVariablesToEEPROM();
+  }
+}
+
+//************************** MAIN LOOOP //************************** MAIN LOOOP //************************** MAIN LOOOP //************************** MAIN LOOOP 
+//************************** MAIN LOOOP //************************** MAIN LOOOP //************************** MAIN LOOOP //************************** MAIN LOOOP 
+
+// Main loop of the program
+void loop() {
+  unsigned long czasBiezacyMs = millis();
+
+  obslugaRuchu();
+  logDebugInfo();
+  wyslijDaneSerwerWWW();
+
+  // Dodaj synchronizację NTP tutaj
+ synchronizujRTCzNTP();
+ handleBluetoothCommands();
+
+  // Debugging: Log status
+  if (DEBUG_MODE) {
+    Serial.print("PIN_CZUJNIKA_RUCHU: ");
+    Serial.print(PIN_CZUJNIKA_RUCHU);
+    Serial.print(", PIN_ZARZADZANIA_LED: ");
+    Serial.print(PIN_ZARZADZANIA_LED);
+    Serial.print(", CZAS_OPUZNIENIA_WYLACZENIA_SEKUNDY: ");
+    Serial.print(CZAS_OPUZNIENIA_WYLACZENIA_SEKUNDY);
+    Serial.print(", PWM_AKTUALNE: ");
+    Serial.print(PWM_AKTUALNE);
+    Serial.print(", MAX_PWM_DZIENNE: ");
+    Serial.print(MAX_PWM_DZIENNE);
+    Serial.print(", PWM_STANDBY: ");
+    Serial.print(PWM_STANDBY);
+    Serial.print(", CZAS_WLACZENIA_MS: ");
+    Serial.print(CZAS_WLACZENIA_MS);
+    Serial.print(", CZAS_BIEZACY_MS: ");
+    Serial.print(CZAS_BIEZACY_MS);
+    Serial.print(", CZAS_OD_WYKRYCIA_RUCHU_MS: ");
+    Serial.println(CZAS_OD_WYKRYCIA_RUCHU_MS);
+
+    // Wyświetlanie wartości zmiennych przechowywanych w EEPROM
+   // Serial.print("EEPROM - MAX_PWM_DZIENNE: ");
+    //Serial.println(MAX_PWM_DZIENNE);
+    //Serial.print("EEPROM - PWM_STANDBY: ");
+    //Serial.println(PWM_STANDBY);
+    //Serial.print("EEPROM - MAX_PWM_NOC: ");
+    //Serial.println(MAX_PWM_NOC);
+    //Serial.print("EEPROM - CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS: ");
+    //Serial.println(CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS);
+    Serial.print("EEPROM - CZAS_SWIECENIA_W_STANDBY_MS: ");
+    Serial.println(CZAS_SWIECENIA_W_STANDBY_MS);
+    //Serial.print("EEPROM - SSID: ");
+    //Serial.println(ssid);
+    //Serial.print("EEPROM - PASSWORD: ");
+    //Serial.println(password);
+  }
+}
+//************************** MAIN LOOOP //************************** MAIN LOOOP //************************** MAIN LOOOP //************************** MAIN LOOOP 
+//************************** MAIN LOOOP //************************** MAIN LOOOP //************************** MAIN LOOOP //************************** MAIN LOOOP
