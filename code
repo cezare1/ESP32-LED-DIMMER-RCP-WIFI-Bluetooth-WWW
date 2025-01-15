@@ -1,18 +1,11 @@
-// This program provides a comprehensive solution for managing an IoT device 
-// with WiFi, NTP, motion detection, PWM control, and Bluetooth functionalities.
-// It includes robust security measures and a user-friendly web interface for 
-// configuration and monitoring. 
+// kod OK - dodano onsługę PWM i zapisy wszytkiego włącznie z czasami
+// poprawiono czas ostatniej synchronizacji - dodano datę 
+// teraz szukam ----     CZAS_OSTATNIEJ_SYNCHRONIZACJI_MS
+// dodajemy osbługę bluetooth dla sytuacji gdy się wywalimy we wpisywaniu SSID i hasła  i stracimy sieć WLAN
+// dodaje ostatnie synchro czasu jeżeli rozjedzie się czas wiecej niż 10 sekund .. i wywalam na www
 
-// The LED control logic is sophisticated, allowing for different behaviors 
-// during day and night modes, and ensuring energy efficiency by dimming 
-// or turning off the LED when no motion is detected.
 
-// The program also ensures accurate timekeeping by synchronizing the RTC 
-// with an NTP server and adjusting the time if necessary. 
 
-// The user can configure the start and end times for day and night modes, 
-// and these times are compared with the current time obtained from the 
-// NTP server or RTC.
 
 
 #include <WiFi.h>
@@ -23,6 +16,34 @@
 #include <vector>
 #include <EEPROM.h>
 #include "BluetoothSerial.h"
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+// BLE UUIDs
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define WIFI_SSID_UUID     "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define WIFI_PASSWORD_UUID  "beb5483e-36e1-4688-b7f5-ea07361b26a9"
+
+// BLE Global variables
+BLEServer* pServer = NULL;
+BLECharacteristic* pWifiSsidCharacteristic = NULL;
+BLECharacteristic* pWifiPasswordCharacteristic = NULL;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+
+// BLE callbacks class
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      deviceConnected = true;
+    };
+
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+    }
+};
+
 
 // Definicje adresów w EEPROM
 const int EEPROM_ADDR_MAX_PWM_DZIENNE = 0;
@@ -52,6 +73,15 @@ char ssid[32];
 char password[64];
 
 // Dane logowania do sieci WiFi
+// Te zmienne są już zadeklarowane powyżej, więc usuwamy ich ponowną deklarację
+// int MAX_PWM_DZIENNE = 220;
+// int PWM_STANDBY = 5;
+// int MAX_PWM_NOC = 10;
+// unsigned long CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS = 20000;  // Time after motion detection (60 seconds) in milliseconds 300 tys dla 5 min
+// unsigned long CZAS_SWIECENIA_W_STANDBY_MS = 20000;          // Time in standby mode (60 seconds) in milliseconds 600 tys dla 10 min
+// char ssid[32] = "ORBI18";             // Nazwa sieci WiFi
+// char password[32] = "izoalkohol123";  // Hasło do sieci WiFi
+
 struct LogEntry {
   String ip;
   String logTime;  // Zmieniona nazwa zmiennej
@@ -70,12 +100,22 @@ const int pwmChannel = 0;       // PWM channel
 const int pwmFrequency = 5000;  // Frequency in Hz
 const int pwmResolution = 8;    // 8-bit resolution (0-255)
 
+
 // przycisk na ww na hasło
 const String correctLogin = "123";
 const String correctPassword = "123";
 
-// Debug mode - set to true to enable serial logging
+
+
+
+
+
+// Debug mode - set to true to enable serial logging// Debug mode - set to true to enable serial logging// Debug mode - set to true to enable serial logging// Debug mode - set to true to enable serial logging// Debug mode - set to true to enable serial logging
 const bool DEBUG_MODE = false;
+// Debug mode - set to true to enable serial logging// Debug mode - set to true to enable serial logging// Debug mode - set to true to enable serial logging// Debug mode - set to true to enable serial logging
+
+
+
 
 // Set this to the pin connected to the PIR motion sensor
 const byte PIN_CZUJNIKA_RUCHU = 16;  // D5 (GPIO14) for PIR sensor on D1 R32
@@ -86,15 +126,19 @@ const byte PIN_ZARZADZANIA_LED = 5;  // D4 (GPIO2) for LED control on D1 R32
 // Set this to change the power-off delay (in seconds)
 const unsigned long CZAS_OPUZNIENIA_WYLACZENIA_SEKUNDY = 60;  // Changed to 30 seconds
 
-// obsługa serial po bluetooth
+// obsługa serial po bluetooth !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 BluetoothSerial SerialBT;
+
 
 // dodajemy zmienną globalną na potrzeby wysyłąnia na serwer
 String ostatnioWyslaneDane = "";
 DateTime czasUruchomieniaSystemu;
 
 String CZAS_OSTATNIEJ_SYNCHRONIZACJI_G_M_S = "";
-String czasUruchomieniaString;
+String czasUruchomieniaString; 
+String ostatnia_synchro_czasu = "nie nastąpiło zdażenie";
+String ostatnia_synchro_czasu_minimalnie_rozjechanego = "nie nastąpiło zdażenie";
+
 
 // Ustawienia NTP
 WiFiUDP ntpUDP;                                             // Obiekt do komunikacji UDP z serwerem NTP
@@ -131,7 +175,6 @@ void wyslijDaneSerwerWWW();
 void obslugaRuchu();
 void aktualizujPWM(unsigned long czasOdWykryciaRuchu);
 void logDebugInfo();
-void Shine_from_current_point_within_5SEC();
 void wyslijDaneNaSerwer();
 void handleRoot();
 void handleReset();
@@ -139,6 +182,9 @@ void handleFakeSetup();
 void handleUpdate();
 void saveVariablesToEEPROM();
 void readEEPROM();
+void podaj_aktualny_czas(String &docelowaZmienna);
+void setupBLE();
+void handleBLE();
 
 void handleFakeSetup() {
   String clientIP = server.client().remoteIP().toString();
@@ -156,6 +202,8 @@ void synchronizujNTP() {
     DateTime ntpTime(epochTime);
     rtc.adjust(ntpTime);
     CZAS_OSTATNIEJ_SYNCHRONIZACJI_MS = czasBiezacyMs;
+
+    podaj_aktualny_czas(ostatnia_synchro_czasu);
 
     if (DEBUG_MODE) {
       Serial.println("Synchronizacja z NTP zakończona.");
@@ -227,6 +275,12 @@ void synchronizujRTCzNTP() {
         Serial.println("RTC zsynchronizowany z NTP.");
         Serial.print("Różnica czasu: ");
         Serial.println(roznicaSekund);
+
+        podaj_aktualny_czas(ostatnia_synchro_czasu_minimalnie_rozjechanego);
+
+
+
+
       }
     } else if (DEBUG_MODE) {
       Serial.println("RTC nie wymaga synchronizacji.");
@@ -272,7 +326,7 @@ void obslugaRuchu() {
       Serial.println(CZAS_WLACZENIA_MS);
     }
 
-    // Rozjaśnianie światła, jeśli wartość PWM jest poniżej progu
+    // Rozjaśnianie światła, jeśli wartość PWM jest poniżej progu -----------!!!!!!!!!!!!!!!!!!!!!!!!!
     if (PWM_AKTUALNE <= 0 || PWM_AKTUALNE < MAX_PWM_DZIENNE) {
       while (PWM_AKTUALNE < MAX_PWM_DZIENNE) {
         PWM_AKTUALNE += 5;  // Zwiększaj PWM o ustalony krok
@@ -364,6 +418,18 @@ void logDebugInfo() {
 
 // Set up the pins connected to the motion sensor and supplying power to the LED controller.
 void setup() {
+  Serial.begin(115200);
+  
+  // Initialize EEPROM
+  EEPROM.begin(512);
+  
+  // Read saved values
+  readEEPROM();
+  
+  // Setup BLE
+  setupBLE();
+  
+  // Rest of your existing setup code...
   pinMode(PIN_CZUJNIKA_RUCHU, INPUT_PULLUP);  // ESP8266 requires explicit pullup
   digitalWrite(PIN_CZUJNIKA_RUCHU, HIGH);     // Enable pull-up resistor (optional)
 
@@ -473,55 +539,34 @@ void setup() {
   SerialBT.begin("ESP32_EEPROM_Config"); // Nazwa Bluetooth widoczna w urządzeniach
   Serial.println("Bluetooth started. Waiting for commands...");
   
+  setupBLE();
 }
 
 
 // obsługa odbierania danych przez bluetooth i zapis ich do EEPROM
 
 void handleBluetoothCommands() {
-  if (SerialBT.available()) {
-    String input = SerialBT.readStringUntil('\n'); // Odczyt danych do znaku nowej linii
-    Serial.print("Received command: ");
-    Serial.println(input);
-
-    // Rozdziel komendę i wartości
-    if (input.startsWith("SET_SSID=")) {
-      String newSSID = input.substring(9); // Wyciągnij wartość po "SET_SSID="
-      if (newSSID.length() > 32) {
-        SerialBT.println("SSID too long! Max 32 characters.");
-        return;
-      }
-      newSSID.toCharArray(ssid, sizeof(ssid)); // Przypisz do zmiennej ssid
-      EEPROM.put(EEPROM_ADDR_SSID, ssid);
-      EEPROM.commit();
-      SerialBT.println("SSID updated successfully.");
-    } else if (input.startsWith("SET_PASSWORD=")) {
-      String newPassword = input.substring(13); // Wyciągnij wartość po "SET_PASSWORD="
-      if (newPassword.length() > 20) {
-        SerialBT.println("Password too long! Max 20 characters.");
-        return;
-      }
-      newPassword.toCharArray(password, sizeof(password)); // Przypisz do zmiennej password
-      EEPROM.put(EEPROM_ADDR_PASSWORD, password);
-      EEPROM.commit();
-      SerialBT.println("Password updated successfully.");
-    } else if (input.startsWith("GET_VALUES")) {
-      // Wysyłanie aktualnych wartości zapisanych w EEPROM
-      SerialBT.println("Current EEPROM values:");
-      SerialBT.printf("MAX_PWM_DZIENNE: %d\n", MAX_PWM_DZIENNE);
-      SerialBT.printf("PWM_STANDBY: %d\n", PWM_STANDBY);
-      SerialBT.printf("MAX_PWM_NOC: %d\n", MAX_PWM_NOC);
-      SerialBT.printf("CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS: %d\n", CZAS_SWIECENIA_PO_WYKRYCIU_RUCHU_MS);
-      SerialBT.printf("CZAS_SWIECENIA_W_STANDBY_MS: %d\n", CZAS_SWIECENIA_W_STANDBY_MS);
-      SerialBT.printf("SSID: %s\n", ssid);
-      SerialBT.printf("Password: %s\n", password);
-    } else {
-      SerialBT.println("Unknown command. Use SET_SSID, SET_PASSWORD, or GET_VALUES.");
+    if (SerialBT.available()) {
+        String command = SerialBT.readStringUntil('\n');
+        
+        // 1. Najpierw odczytujemy wszystkie zmienne z EEPROM
+        readEEPROM();
+        
+        // 2. Modyfikujemy tylko SSID lub hasło
+        if (command.startsWith("SSID:")) {
+            String newSsid = command.substring(5);
+            strncpy(ssid, newSsid.c_str(), sizeof(ssid) - 1);
+            SerialBT.println("SSID set to: " + String(ssid));
+            saveVariablesToEEPROM();
+        }
+        else if (command.startsWith("PASS:")) {
+            String newPass = command.substring(5);
+            strncpy(password, newPass.c_str(), sizeof(password) - 1);
+            SerialBT.println("Password updated");
+            saveVariablesToEEPROM();
+        }
     }
-  }
 }
-
-
 
 
 // Funkcja do ustawienia czasu w zmiennej czasUruchomieniaString =- ----- zwraca czas uruchomienia systemu w Main Setup STRING do wyświetlenia - jest RAZ bo RAZ się system włącza 
@@ -544,41 +589,39 @@ czasUruchomieniaString = yearStr + "-" + monthStr + "-" + dayStr + " " +
 }
 
 
-// Function to brighten from current PWM to MAX_PWM_DZIENNE within 5 seconds
-// Function to brighten from current PWM to MAX_PWM_DZIENNE within 5 seconds
-void Shine_from_current_point_within_5SEC() {
-    int durationMS = 5000;  // Czas rozjaśniania w milisekundach
-    unsigned long startTime = millis();
-    int stepCount = MAX_PWM_DZIENNE - PWM_AKTUALNE;
 
-    if (stepCount <= 0) {
-        return;  // Jeśli PWM jest już maksymalne, zakończ funkcję
-    }
+// -----------------------------------------------------// -----------------------------------------------------// -----------------------------------------------------// -----------------------------------------------------// -----------------------------------------------------
 
-    int stepDelay = durationMS / stepCount;
-    if (stepDelay < 5) {
-        stepDelay = 5;  // Minimalny czas na krok
-    }
 
-    for (int pwmValue = PWM_AKTUALNE; pwmValue <= MAX_PWM_DZIENNE; pwmValue++) {
-        if (millis() - startTime >= durationMS) {
-            break;  // Wyjście z pętli po upływie czasu
-        }
+// dodaj czas do zmiennej - funcja zwraca do zmiennej swój wynik   przykłąd podaj_aktualny_czas(wynik); wyst deklarować funkcja globalna zmienna też
+void podaj_aktualny_czas (String &docelowaZmienna) {
+  DateTime now = rtc.now();  // Pobranie bieżącego czasu z zegara RTC
 
-        PWM_AKTUALNE = pwmValue;  // Zaktualizuj aktualną wartość PWM
-        ledcWrite(pwmChannel, PWM_AKTUALNE);  // Wyślij wartość do kanału PWM
-        delay(stepDelay);  // Poczekaj na kolejny krok
-    }
+  // Formatowanie daty w formacie "YYYY-MM-DD"
+  String yearStr = String(now.year());
+  String monthStr = (now.month() < 10) ? "0" + String(now.month()) : String(now.month());
+  String dayStr = (now.day() < 10) ? "0" + String(now.day()) : String(now.day());
 
-    // Upewnij się, że wartość PWM jest równa MAX_PWM_DZIENNE na koniec
-    PWM_AKTUALNE = MAX_PWM_DZIENNE;
-    ledcWrite(pwmChannel, PWM_AKTUALNE);
+  // Formatowanie czasu w formacie "hh:mm:ss"
+  String hourStr = (now.hour() < 10) ? "0" + String(now.hour()) : String(now.hour());
+  String minuteStr = (now.minute() < 10) ? "0" + String(now.minute()) : String(now.minute());
+  String secondStr = (now.second() < 10) ? "0" + String(now.second()) : String(now.second());
 
-    // Po rozjaśnieniu spróbuj połączyć się z WiFi, jeśli jest rozłączone
-    if (WiFi.status() != WL_CONNECTED) {
-        polaczZWIFI();  // Wywołanie funkcji połączenia z WiFi
-    }
+  // Składanie ciągu daty i czasu i przypisanie do podanej zmiennej
+  docelowaZmienna = yearStr + "-" + monthStr + "-" + dayStr + " " +
+                    hourStr + ":" + minuteStr + ":" + secondStr;
 }
+
+// -----------------------------------------------------// -----------------------------------------------------// -----------------------------------------------------// -----------------------------------------------------
+
+
+
+
+
+
+
+
+
 
 
 
@@ -753,31 +796,65 @@ html += "<h2>DOZWOLONA ROZBIEŻNOŚĆ RCP NTP (sec) :</h2>";
 html += String(dozwolona_roznica_sekund_RCP_NTP) + " sekund<br>";
 
 
+// pobierzGodzineZRtc - zrobilem string pusty na razie
 html += "<h2>CZAS_OSTATNIEJ_SYNCHRONIZACJI_MS (godzina):</h2>";
-html += String(hours) + ":" + String(minutes) + ":" + String(seconds) + "<br>";
+html += "<pre>" + ostatnia_synchro_czasu + "</pre>";
+
+
+// pobierzGodzineZRtc - zrobilem string pusty na razie
+html += "<h2>OSTATNI ROZJAZD ZEGARA RCP z NTP o 10 sekund:</h2>";
+html += "<pre>" + ostatnia_synchro_czasu_minimalnie_rozjechanego + "</pre>";
+
+
+
+
+
+
 html += "<p><a href=\"/send\">Wyślij dane na serwer</a></p>";
 
- // Dodanie informacji o stanie ESP32
- html += "<h2>Informacje o stanie ESP32:</h2>";
-html += "<pre>";
-html += "WiFi SSID: " + String(WiFi.SSID()) + "\n";
-html += "WiFi RSSI: " + String(WiFi.RSSI()) + " dBm\n";
-html += "WiFi IP: " + WiFi.localIP().toString() + "\n";
-html += "WiFi MAC: " + WiFi.macAddress() + "\n";
-html += "CPU Frequency: " + String(ESP.getCpuFreqMHz()) + " MHz\n";
-html += "Free Heap: " + String(ESP.getFreeHeap()) + " bytes\n";
-html += "Chip Revision: " + String(ESP.getChipRevision()) + "\n";
-html += "Flash Chip Size: " + String(ESP.getFlashChipSize()) + " bytes\n";
-html += "Sketch Size: " + String(ESP.getSketchSize()) + " bytes\n";
-html += "Free Sketch Space: " + String(ESP.getFreeSketchSpace()) + " bytes\n";
-html += "</pre>";
+ // Informacje o stanie ESP32
+  html += "<h2>Informacje o stanie ESP32:</h2>";
+  html += "<pre>";
+  html += "WiFi SSID: " + String(WiFi.SSID()) + "\n";
+  html += "WiFi RSSI: " + String(WiFi.RSSI()) + " dBm\n";
+  html += "WiFi IP: " + WiFi.localIP().toString() + "\n";
+  html += "WiFi MAC: " + WiFi.macAddress() + "\n";
+  html += "CPU Frequency: " + String(ESP.getCpuFreqMHz()) + " MHz\n";
+  html += "Free Heap: " + String(ESP.getFreeHeap()) + " bytes\n";
+  html += "Chip Revision: " + String(ESP.getChipRevision()) + "\n";
+  html += "Flash Chip Size: " + String(ESP.getFlashChipSize()) + " bytes\n";
+  html += "Sketch Size: " + String(ESP.getSketchSize()) + " bytes\n";
+  html += "Free Sketch Space: " + String(ESP.getFreeSketchSpace()) + " bytes\n";
+  html += "</pre>";
 
- // Dodanie informacji o stanie Bluetooth
+  // Informacje o dostępnych sieciach Wi-Fi w okolicy
+  html += "<h2>Wszystkie dostępne sieci Wi-Fi:</h2>";
+  html += "<pre>";
+  int n = WiFi.scanNetworks();
+  if (n == 0) {
+    html += "Brak dostępnych sieci Wi-Fi\n";
+  } else {
+    for (int i = 0; i < n; i++) {
+      html += "SSID: " + WiFi.SSID(i) + "\n";
+      html += "RSSI: " + String(WiFi.RSSI(i)) + " dBm\n";
+      html += "Mac Address: " + WiFi.BSSIDstr(i) + "\n";
+      html += "Channel: " + String(WiFi.channel(i)) + "\n";
+      html += "Encryption: " + String(WiFi.encryptionType(i)) + "\n\n";
+    }
+  }
+  html += "</pre>";
+
+  // Informacje o stanie Bluetooth
   html += "<h2>Informacje o stanie Bluetooth:</h2>";
   html += "<pre>";
   html += String("Bluetooth Name: ESP32_BT\n");  // Nazwa ustalona w SerialBT.begin()
   html += String("Bluetooth Status: ") + (SerialBT.hasClient() ? "Connected" : "Not Connected") + "\n";
+
+  // Wyszukiwanie urządzeń Bluetooth w okolicy
+  
+  
   html += "</pre>";
+
 
  
 
@@ -998,6 +1075,9 @@ void readEEPROM() {
 
 // Main loop of the program
 void loop() {
+  // Handle BLE
+  handleBLE();
+  
   unsigned long czasBiezacyMs = millis();
 
   obslugaRuchu();
@@ -1007,6 +1087,7 @@ void loop() {
   // Dodaj synchronizację NTP tutaj
  synchronizujRTCzNTP();
  handleBluetoothCommands();
+ handleBLE();
 
   // Debugging: Log status
   if (DEBUG_MODE) {
@@ -1047,4 +1128,69 @@ void loop() {
   }
 }
 //************************** MAIN LOOOP //************************** MAIN LOOOP //************************** MAIN LOOOP //************************** MAIN LOOOP 
-//************************** MAIN LOOOP //************************** MAIN LOOOP //************************** MAIN LOOOP //************************** MAIN LOOOP
+//************************** MAIN LOOOP //************************** MAIN LOOOP //************************** MAIN LOOOP //************************** MAIN LOOOP 
+
+void setupBLE() {
+  // Create the BLE Device
+  BLEDevice::init("ESP32_KITCHEN");
+
+  // Create the BLE Server
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  // Create the BLE Service
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  // Create BLE Characteristics
+  pWifiSsidCharacteristic = pService->createCharacteristic(
+                             WIFI_SSID_UUID,
+                             BLECharacteristic::PROPERTY_READ |
+                             BLECharacteristic::PROPERTY_WRITE
+                           );
+
+  pWifiPasswordCharacteristic = pService->createCharacteristic(
+                                 WIFI_PASSWORD_UUID,
+                                 BLECharacteristic::PROPERTY_READ |
+                                 BLECharacteristic::PROPERTY_WRITE
+                               );
+
+  // Start the service
+  pService->start();
+
+  // Start advertising
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);  
+  pAdvertising->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
+}
+
+void handleBLE() {
+  // Disconnecting
+  if (!deviceConnected && oldDeviceConnected) {
+      delay(500); // Give the bluetooth stack the chance to get things ready
+      pServer->startAdvertising(); // Restart advertising
+      oldDeviceConnected = deviceConnected;
+  }
+  // Connecting
+  if (deviceConnected && !oldDeviceConnected) {
+      oldDeviceConnected = deviceConnected;
+  }
+
+  // Handle BLE commands here
+  if (deviceConnected) {
+    // Check if new WiFi credentials were received
+    if (pWifiSsidCharacteristic->getValue().length() > 0) {
+      String newSsid = pWifiSsidCharacteristic->getValue().c_str();
+      strncpy(ssid, newSsid.c_str(), sizeof(ssid) - 1);
+      saveVariablesToEEPROM();
+    }
+    
+    if (pWifiPasswordCharacteristic->getValue().length() > 0) {
+      String newPassword = pWifiPasswordCharacteristic->getValue().c_str();
+      strncpy(password, newPassword.c_str(), sizeof(password) - 1);
+      saveVariablesToEEPROM();
+    }
+  }
+}
